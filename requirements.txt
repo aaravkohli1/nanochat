@@ -1,0 +1,5 @@
+torch
+sonic_moe
+flash_attn
+pyarrow
+filelock

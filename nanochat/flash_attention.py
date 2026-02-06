@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 
+
 # =============================================================================
 # Detection: Try to load FA3 on Hopper+ GPUs
 # =============================================================================
@@ -30,11 +31,10 @@ def _load_flash_attention_3():
         # Ada (sm89), Blackwell (sm100) need SDPA fallback until FA3 is recompiled
         if major != 9:
             return None
-        import os
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
-    except Exception:
+        
+        import flash_attn 
+        return flash_attn
+    except ImportError:
         return None
 
 

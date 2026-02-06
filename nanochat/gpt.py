@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+from sonic_moe import MOE
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -118,24 +119,25 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class MLP(nn.Module):
-    def __init__(self, config):
+class MLPMoe(nn.Module):
+    def __init__(self, config, number_experts=8, top_k=2):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.moe = MOE(
+            hidden_size=config.n_embd,
+            intermediate_size=4 * config.n_embd,
+            num_experts=number_experts,
+            top_k=top_k,
+        )
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
+        self.moe(x)
 
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MLPMoe(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
