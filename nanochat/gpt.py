@@ -21,7 +21,8 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
-from sonic_moe import MOE
+from sonicmoe import MoE, KernelBackendMoE
+from sonicmoe.enums import ActivationType
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -120,17 +121,22 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLPMoe(nn.Module):
-    def __init__(self, config, number_experts=8, top_k=2):
+    def __init__(self, config, num_experts=8, top_k=2):
         super().__init__()
-        self.moe = MOE(
+        self.moe = MoE(
+            num_experts=num_experts,
+            num_experts_per_tok=top_k,  # top-k
             hidden_size=config.n_embd,
             intermediate_size=4 * config.n_embd,
-            num_experts=number_experts,
-            top_k=top_k,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
         )
 
     def forward(self, x):
-        self.moe(x)
+        output, aux_loss = self.moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe)
+        self.last_aux_loss = aux_loss
+        return output
 
 
 class Block(nn.Module):
@@ -215,8 +221,6 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -402,10 +406,16 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+
+        moe_aux_loss = 0.0
+
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+
+            if hasattr(block.mlp, 'last_aux_loss'):
+                moe_aux_loss = moe_aux_loss + block.mlp.last_aux_loss
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -419,6 +429,7 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            loss = loss + 0.01 * moe_aux_loss
             return loss
         else:
             # inference: just return the logits directly
